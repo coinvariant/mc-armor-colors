@@ -1,5 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 
 fn red(rgb: u32) -> i32 {
@@ -155,39 +156,38 @@ fn apply_pattern(prev_color: Option<u32>, pat: &Pattern) -> u32 {
 
 
 struct Bitset {
-    data: Vec<u8>,
+    data: Vec<AtomicU8>,
 }
 
 impl Bitset {
     fn new(bits: usize) -> Self {
         let bytes = (bits + 7) / 8;
         Bitset {
-            data: vec![0u8; bytes],
+            data: (0..bytes).map(|_| AtomicU8::new(0)).collect(),
         }
     }
 
-    fn get(&self, idx: u32) -> bool {
+    fn check_and_set(&mut self, idx: u32) -> bool {
         let i = idx as usize;
         let byte = i / 8;
         let bit = i % 8;
-        (self.data[byte] & (1u8 << bit)) != 0
-    }
-
-    fn set(&mut self, idx: u32) {
-        let i = idx as usize;
-        let byte = i / 8;
-        let bit = i % 8;
-        self.data[byte] |= 1u8 << bit;
+        let prev = self.data[byte].fetch_or(1u8 << bit, Ordering::Relaxed);
+        (prev & (1u8 << bit)) != 0
     }
 
     fn count_ones(&self) -> u64 {
         self.data
         .iter()
-        .map(|b| b.count_ones() as u64)
+        .map(|b| b.load(Ordering::Relaxed).count_ones() as u64)
         .sum()
     }
 }
 
+struct Edge {
+    start_color: Option<u32>,
+    end_color: u32,
+    pattern: Pattern,
+}
 
 fn main() {
     let start_time = Instant::now();
@@ -198,14 +198,17 @@ fn main() {
 
     let mut visited = Bitset::new(1 << 24);
     let mut frontier: VecDeque<u32> = VecDeque::new();
+    let mut edges: Vec<Edge> = Vec::new();
 
     println!("Computing colors from undyed armor (first dyeing)...");
     for pat in &patterns {
         let color = apply_pattern(None, pat);
         let id = color_id_from_rgb(color);
-        if !visited.get(id) {
-            visited.set(id);
+        if !visited.check_and_set(id) {
             frontier.push_back(id);
+            edges.push(
+                Edge { start_color: None, end_color: color, pattern: *pat }
+            );
         }
     }
 
@@ -235,8 +238,7 @@ fn main() {
             for pat in &patterns {
                 let new_color = apply_pattern(Some(current_id), pat);
                 let new_id = color_id_from_rgb(new_color);
-                if !visited.get(new_id) {
-                    visited.set(new_id);
+                if !visited.check_and_set(new_id) {
                     next_frontier.push_back(new_id);
                 }
             }
