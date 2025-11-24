@@ -227,7 +227,6 @@ fn write_edges<W: Write>(w: &mut W, edges: &[Edge]) -> io::Result<()> {
     Ok(())
 }
 
-/// Progress bar: prints one line and rewrites it with '\r'.
 fn print_progress(processed: u64, total: u64, start_time: Instant) {
     let elapsed = start_time.elapsed().as_secs_f64();
     let frac = if total > 0 { processed as f64 / total as f64 } else { 0.0 };
@@ -306,7 +305,6 @@ fn main() {
         let substep = AtomicU64::new(0); 
         println!("Level size {:3}", level_size);
 
-        // Move the frontier into a Vec for chunking
         let current_frontier: Vec<u32> = frontier.drain(..).collect();
 
         let mut next_frontier: Vec<u32> = Vec::new();
