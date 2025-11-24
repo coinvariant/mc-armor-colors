@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
-use std::sync::atomic::{AtomicU8, Ordering};
-
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::{env, thread};
 
 fn red(rgb: u32) -> i32 {
     ((rgb >> 16) & 0xFF) as i32
@@ -32,28 +32,26 @@ fn rgb_from_id(id: u32) -> (i32, i32, i32) {
     (red(id), green(id), blue(id))
 }
 
-
 const DYE_COLORS: [u32; 16] = [
     11546150, // Red
-16351261, // Orange
-16701501, // Yellow
-8439583,  // Lime
-6192150,  // Green
-3847130,  // Light Blue
-1481884,  // Cyan
-3949738,  // Blue
-8991416,  // Purple
-13061821, // Magenta
-15961002, // Pink
-16383998, // White
-10329495, // Light Gray
-4673362,  // Gray
-1908001,  // Black
-8606770,  // Brown
+    16351261, // Orange
+    16701501, // Yellow
+    8439583,  // Lime
+    6192150,  // Green
+    3847130,  // Light Blue
+    1481884,  // Cyan
+    3949738,  // Blue
+    8991416,  // Purple
+    13061821, // Magenta
+    15961002, // Pink
+    16383998, // White
+    10329495, // Light Gray
+    4673362,  // Gray
+    1908001,  // Black
+    8606770,  // Brown
 ];
 
 const MAX_DYES_PER_STEP: usize = 8;
-
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct Pattern {
@@ -154,7 +152,6 @@ fn apply_pattern(prev_color: Option<u32>, pat: &Pattern) -> u32 {
     make_rgb(r_avg, g_avg, b_avg)
 }
 
-
 struct Bitset {
     data: Vec<AtomicU8>,
 }
@@ -167,22 +164,25 @@ impl Bitset {
         }
     }
 
-    fn check_and_set(&mut self, idx: u32) -> bool {
+    /// Returns true if the bit was already set, false if we just set it.
+    fn check_and_set(&self, idx: u32) -> bool {
         let i = idx as usize;
         let byte = i / 8;
         let bit = i % 8;
-        let prev = self.data[byte].fetch_or(1u8 << bit, Ordering::Relaxed);
-        (prev & (1u8 << bit)) != 0
+        let mask = 1u8 << bit;
+        let prev = self.data[byte].fetch_or(mask, Ordering::Relaxed);
+        (prev & mask) != 0
     }
 
     fn count_ones(&self) -> u64 {
         self.data
-        .iter()
-        .map(|b| b.load(Ordering::Relaxed).count_ones() as u64)
-        .sum()
+            .iter()
+            .map(|b| b.load(Ordering::Relaxed).count_ones() as u64)
+            .sum()
     }
 }
 
+#[derive(Clone, Copy)]
 struct Edge {
     start_color: Option<u32>,
     end_color: u32,
@@ -192,11 +192,22 @@ struct Edge {
 fn main() {
     let start_time = Instant::now();
 
+    let args: Vec<String> = env::args().collect();
+    let requested_threads = if args.len() > 1 {
+        args[1].parse::<usize>().unwrap_or(1)
+    } else {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    };
+    let num_threads = requested_threads.max(1);
+    println!("Using {} threads", num_threads);
+
     println!("Generating dye patterns...");
     let patterns = generate_patterns();
     println!("Number of unique patterns: {}", patterns.len());
 
-    let mut visited = Bitset::new(1 << 24);
+    let visited = Bitset::new(1 << 24);
     let mut frontier: VecDeque<u32> = VecDeque::new();
     let mut edges: Vec<Edge> = Vec::new();
 
@@ -206,46 +217,91 @@ fn main() {
         let id = color_id_from_rgb(color);
         if !visited.check_and_set(id) {
             frontier.push_back(id);
-            edges.push(
-                Edge { start_color: None, end_color: color, pattern: *pat }
-            );
+            edges.push(Edge {
+                start_color: None,
+                end_color: color,
+                pattern: *pat,
+            });
         }
     }
 
     let mut total = visited.count_ones();
     println!(
         "Initial reachable colors after first dye: {} (time: {:.2?})",
-             total,
-             start_time.elapsed()
+        total,
+        start_time.elapsed()
     );
 
     let mut step = 0usize;
-    let mut substep = 0u64;
+    let substep = AtomicU64::new(0);
 
     while !frontier.is_empty() {
         step += 1;
         let level_size = frontier.len();
-        let mut next_frontier: VecDeque<u32> = VecDeque::new();
-
         let level_start_time = Instant::now();
         println!("Level size {:3}", level_size);
 
-        for _ in 0..level_size {
-            substep += 1;
-            if substep % 1000 == 0 {println!("Substep {:3}", substep)}
-            let current_id = frontier.pop_front().unwrap();
+        // Move the frontier into a Vec for chunking
+        let current_frontier: Vec<u32> = frontier.drain(..).collect();
 
-            for pat in &patterns {
-                let new_color = apply_pattern(Some(current_id), pat);
-                let new_id = color_id_from_rgb(new_color);
-                if !visited.check_and_set(new_id) {
-                    next_frontier.push_back(new_id);
+        let mut next_frontier: Vec<u32> = Vec::new();
+        let mut level_edges: Vec<Edge> = Vec::new();
+
+        let threads_for_level = num_threads.min(level_size.max(1));
+        let chunk_size = (level_size + threads_for_level - 1) / threads_for_level;
+
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+
+            for t in 0..threads_for_level {
+                let start = t * chunk_size;
+                if start >= level_size {
+                    break;
                 }
-            }
-        }
+                let end = ((t + 1) * chunk_size).min(level_size);
 
-        total = visited.count_ones();
+                let slice = &current_frontier[start..end];
+                let patterns_ref = &patterns;
+                let visited_ref = &visited;
+                let substep_ref = &substep;
+
+                handles.push(scope.spawn(move || {
+                    let mut local_next = Vec::new();
+                    let mut local_edges = Vec::new();
+
+                    for &current_id in slice {
+                        let s = substep_ref.fetch_add(1, Ordering::Relaxed) + 1;
+                        if s % 1000 == 0 {
+                            println!("Substep {}", s);
+                        }
+
+                        for pat in patterns_ref {
+                            let new_color = apply_pattern(Some(current_id), pat);
+                            let new_id = color_id_from_rgb(new_color);
+                            if !visited_ref.check_and_set(new_id) {
+                                local_next.push(new_id);
+                                local_edges.push(Edge {
+                                    start_color: Some(current_id),
+                                    end_color: new_color,
+                                    pattern: *pat,
+                                });
+                            }
+                        }
+                    }
+
+                    (local_next, local_edges)
+                }));
+            }
+
+            for handle in handles {
+                let (local_next, local_edges_local) = handle.join().unwrap();
+                next_frontier.extend(local_next);
+                level_edges.extend(local_edges_local);
+            }
+        });
+
         let added = next_frontier.len();
+        total = visited.count_ones();
 
         println!(
             "Step {:3}: frontier processed = {:8}, new colors = {:8}, total = {:9}, step time = {:.2?}, total time = {:.2?}",
@@ -254,7 +310,7 @@ fn main() {
             added,
             total,
             level_start_time.elapsed(),
-                 start_time.elapsed()
+            start_time.elapsed()
         );
 
         if added == 0 {
@@ -262,12 +318,17 @@ fn main() {
             break;
         }
 
-        frontier = next_frontier;
+        // Here you can write `level_edges` to disk per level if desired.
+        // For now we just accumulate them:
+        edges.extend(level_edges);
+
+        // Prepare frontier for next level
+        frontier = next_frontier.into_iter().collect();
     }
 
     println!(
         "Finished. Total reachable colors: {} (elapsed: {:.2?})",
-             visited.count_ones(),
-             start_time.elapsed()
+        visited.count_ones(),
+        start_time.elapsed()
     );
 }
