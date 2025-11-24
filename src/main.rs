@@ -3,6 +3,9 @@ use std::time::Instant;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::{env, thread};
 
+use std::fs::File;
+use std::io::{self, Write, BufWriter};
+
 fn red(rgb: u32) -> i32 {
     ((rgb >> 16) & 0xFF) as i32
 }
@@ -189,6 +192,62 @@ struct Edge {
     pattern: Pattern,
 }
 
+/// Binary writer for edges.
+/// Layout per edge (little-endian):
+///   start_color: u32   (0xFFFF_FFFF means None)
+///   end_color:   u32
+///   sr:          u16
+///   sg:          u16
+///   sb:          u16
+///   sm:          u16
+///   k:           u8
+fn write_edge<W: Write>(w: &mut W, e: &Edge) -> io::Result<()> {
+    let start = e.start_color.unwrap_or(u32::MAX);
+    let end = e.end_color;
+    let p = e.pattern;
+    let sr = p.sr as u16;
+    let sg = p.sg as u16;
+    let sb = p.sb as u16;
+    let sm = p.sm as u16;
+
+    w.write_all(&start.to_le_bytes())?;
+    w.write_all(&end.to_le_bytes())?;
+    w.write_all(&sr.to_le_bytes())?;
+    w.write_all(&sg.to_le_bytes())?;
+    w.write_all(&sb.to_le_bytes())?;
+    w.write_all(&sm.to_le_bytes())?;
+    w.write_all(&[p.k])?;
+    Ok(())
+}
+
+fn write_edges<W: Write>(w: &mut W, edges: &[Edge]) -> io::Result<()> {
+    for e in edges {
+        write_edge(w, e)?;
+    }
+    Ok(())
+}
+
+/// Progress bar: prints one line and rewrites it with '\r'.
+fn print_progress(processed: u64, total: u64, start_time: Instant) {
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let frac = if total > 0 { processed as f64 / total as f64 } else { 0.0 };
+    let eta_min = if frac > 0.0 {
+        let total_sec = elapsed / frac;
+        let remaining = (total_sec - elapsed).max(0.0);
+        remaining / 60.0
+    } else {
+        f64::INFINITY
+    };
+
+    print!(
+        "\rColors processed: {} / {} ; ETA: {:.1} min",
+        processed,
+        total,
+        if eta_min.is_finite() { eta_min } else { f64::INFINITY }
+    );
+    io::stdout().flush().ok();
+}
+
 fn main() {
     let start_time = Instant::now();
 
@@ -203,27 +262,33 @@ fn main() {
     let num_threads = requested_threads.max(1);
     println!("Using {} threads", num_threads);
 
+    let edge_file = File::create("edges.bin").expect("failed to create edges.bin");
+    let mut edge_writer = BufWriter::new(edge_file);
+
     println!("Generating dye patterns...");
     let patterns = generate_patterns();
     println!("Number of unique patterns: {}", patterns.len());
 
     let visited = Bitset::new(1 << 24);
     let mut frontier: VecDeque<u32> = VecDeque::new();
-    let mut edges: Vec<Edge> = Vec::new();
 
     println!("Computing colors from undyed armor (first dyeing)...");
+    let mut initial_edges: Vec<Edge> = Vec::new();
     for pat in &patterns {
         let color = apply_pattern(None, pat);
         let id = color_id_from_rgb(color);
         if !visited.check_and_set(id) {
             frontier.push_back(id);
-            edges.push(Edge {
+            initial_edges.push(Edge {
                 start_color: None,
                 end_color: color,
                 pattern: *pat,
             });
         }
     }
+
+    write_edges(&mut edge_writer, &initial_edges).expect("failed to write initial edges");
+    initial_edges.clear();
 
     let mut total = visited.count_ones();
     println!(
@@ -232,13 +297,13 @@ fn main() {
         start_time.elapsed()
     );
 
-    let mut step = 0usize;
-    let substep = AtomicU64::new(0);
-
+    let mut step = 1usize;
+    
     while !frontier.is_empty() {
         step += 1;
         let level_size = frontier.len();
         let level_start_time = Instant::now();
+        let substep = AtomicU64::new(0); 
         println!("Level size {:3}", level_size);
 
         // Move the frontier into a Vec for chunking
@@ -271,8 +336,8 @@ fn main() {
 
                     for &current_id in slice {
                         let s = substep_ref.fetch_add(1, Ordering::Relaxed) + 1;
-                        if s % 1000 == 0 {
-                            println!("Substep {}", s);
+                        if s % 2048 == 0 {
+                            print_progress(s, level_size as u64, level_start_time);
                         }
 
                         for pat in patterns_ref {
@@ -300,11 +365,14 @@ fn main() {
             }
         });
 
+        write_edges(&mut edge_writer, &level_edges).expect("failed to write level edges");
+        level_edges.clear();
+
         let added = next_frontier.len();
         total = visited.count_ones();
 
         println!(
-            "Step {:3}: frontier processed = {:8}, new colors = {:8}, total = {:9}, step time = {:.2?}, total time = {:.2?}",
+            "\nStep {:3}: frontier processed = {:8}, new colors = {:8}, total = {:9}, step time = {:.2?}, total time = {:.2?}",
             step,
             level_size,
             added,
@@ -314,17 +382,16 @@ fn main() {
         );
 
         if added == 0 {
-            println!("No new colors found; search saturated.");
+            println!("\nNo new colors found; search saturated.");
             break;
         }
 
-        // Here you can write `level_edges` to disk per level if desired.
-        // For now we just accumulate them:
-        edges.extend(level_edges);
-
-        // Prepare frontier for next level
         frontier = next_frontier.into_iter().collect();
     }
+
+    println!();
+
+    edge_writer.flush().ok();
 
     println!(
         "Finished. Total reachable colors: {} (elapsed: {:.2?})",
